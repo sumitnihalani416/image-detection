@@ -1,0 +1,6 @@
+cmake
+libopenblas-dev
+liblapack-dev
+libatlas-base-dev
+gfortran
+build-essential
