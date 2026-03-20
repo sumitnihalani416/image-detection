@@ -1,5 +1,6 @@
 import streamlit as st
-import face_recognition
+import mediapipe as mp
+import cv2
 import numpy as np
 import pandas as pd
 import sqlite3
@@ -16,7 +17,7 @@ def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS users 
-                 (id INTEGER PRIMARY KEY, name TEXT UNIQUE, encoding BLOB)''')
+                 (id INTEGER PRIMARY KEY, name TEXT UNIQUE, landmarks BLOB)''')
     c.execute('''CREATE TABLE IF NOT EXISTS attendance 
                  (id INTEGER PRIMARY KEY, name TEXT, date TEXT, time TEXT)''')
     conn.commit()
@@ -24,13 +25,13 @@ def init_db():
 
 def load_known_faces():
     conn = sqlite3.connect(DB_PATH)
-    df = pd.read_sql_query("SELECT name, encoding FROM users", conn)
+    df = pd.read_sql_query("SELECT name, landmarks FROM users", conn)
     conn.close()
     if df.empty:
         return [], []
     known_names = df['name'].tolist()
-    known_encodings = [pickle.loads(blob) for blob in df['encoding']]
-    return known_names, known_encodings
+    known_landmarks = [pickle.loads(blob) for blob in df['landmarks']]
+    return known_names, known_landmarks
 
 def mark_attendance_in_db(name: str):
     today = datetime.now().strftime('%Y-%m-%d')
@@ -46,7 +47,29 @@ def mark_attendance_in_db(name: str):
         st.info(f"ℹ️ {name} already marked today.")
     conn.close()
 
+# ====================== MediaPipe SETUP ======================
+mp_face_detection = mp.solutions.face_detection
+mp_drawing = mp.solutions.drawing_utils
+mp_face_mesh = mp.solutions.face_mesh  # for landmarks
+
+face_detection = mp_face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.5)
+face_mesh = mp_face_mesh.FaceMesh(static_image_mode=True, max_num_faces=5, min_detection_confidence=0.5)
+
 # ====================== HELPER FUNCTIONS ======================
+def extract_landmarks(image_np):
+    results = face_mesh.process(image_np)
+    if not results.multi_face_landmarks:
+        return None
+    # Take first face for simplicity (or average multiple later)
+    landmarks = results.multi_face_landmarks[0].landmark
+    vec = np.array([[lm.x, lm.y, lm.z] for lm in landmarks]).flatten()
+    # Normalize (important for scale/rotation invariance)
+    vec = (vec - vec.mean()) / (vec.std() + 1e-8)
+    return vec
+
+def cosine_similarity(a, b):
+    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-8)
+
 def process_image_for_recognition(uploaded_file):
     image_pil = Image.open(io.BytesIO(uploaded_file.getvalue()))
     image_np = np.array(image_pil.convert('RGB'))
@@ -55,127 +78,128 @@ def process_image_for_recognition(uploaded_file):
 def draw_recognized_faces(image_pil, face_locations, names):
     draw = ImageDraw.Draw(image_pil)
     try:
-        font = ImageFont.truetype("arial.ttf", 30)
+        font = ImageFont.truetype("arial.ttf", 24)
     except:
         font = ImageFont.load_default()
     
-    for (top, right, bottom, left), name in zip(face_locations, names):
-        # Draw box
+    for (ymin, xmin, ymax, xmax), name in zip(face_locations, names):  # MediaPipe uses normalized coords
+        h, w = image_pil.size[1], image_pil.size[0]
+        left, top, right, bottom = int(xmin * w), int(ymin * h), int(xmax * w), int(ymax * h)
         draw.rectangle(((left, top), (right, bottom)), outline="lime", width=4)
-        # Draw label
         text = f" {name} "
-        bbox = draw.textbbox((left, top-40), text, font=font)
+        bbox = draw.textbbox((left, top-30), text, font=font)
         draw.rectangle(bbox, fill="lime")
-        draw.text((left, top-40), text, fill="black", font=font)
+        draw.text((left, top-30), text, fill="black", font=font)
     return image_pil
 
 # ====================== STREAMLIT APP ======================
 init_db()
-st.set_page_config(page_title="Face Attendance System", layout="wide")
-st.title("🧑‍💼 AI Face Recognition Attendance System")
+st.set_page_config(page_title="Face Attendance – MediaPipe", layout="wide")
+st.title("🧑‍💼 AI Face Attendance System (MediaPipe Edition)")
 st.markdown("---")
 
-tab1, tab2, tab3, tab4 = st.tabs(["📸 Register New User", "🔍 Mark Attendance", "👥 Registered Users", "📊 Attendance Logs"])
+tab1, tab2, tab3, tab4 = st.tabs(["📸 Register", "🔍 Mark Attendance", "👥 Users", "📊 Logs"])
 
-# ====================== TAB 1: REGISTER ======================
 with tab1:
     st.header("Register New User")
-    name = st.text_input("Full Name (must be unique)")
-    uploaded_images = st.file_uploader("Upload 3–10 clear face photos (JPG/PNG)", 
-                                      accept_multiple_files=True, type=["jpg", "jpeg", "png"])
+    name = st.text_input("Full Name (unique)")
+    uploaded_images = st.file_uploader("Upload 3–8 clear face photos", accept_multiple_files=True, type=["jpg", "jpeg", "png"])
     
-    if st.button("🚀 Register User") and name and uploaded_images:
-        encodings_list = []
-        progress_bar = st.progress(0)
+    if st.button("🚀 Register") and name and uploaded_images:
+        landmarks_list = []
+        progress = st.progress(0)
         
         for i, file in enumerate(uploaded_images):
             img_np, _ = process_image_for_recognition(file)
-            enc = face_recognition.face_encodings(img_np)
-            if enc:
-                encodings_list.append(enc[0])
-            progress_bar.progress((i+1)/len(uploaded_images))
+            vec = extract_landmarks(img_np)
+            if vec is not None:
+                landmarks_list.append(vec)
+            progress.progress((i+1)/len(uploaded_images))
         
-        if encodings_list:
-            avg_encoding = np.mean(encodings_list, axis=0)
-            encoding_blob = pickle.dumps(avg_encoding)
+        if landmarks_list:
+            avg_vec = np.mean(landmarks_list, axis=0)
+            blob = pickle.dumps(avg_vec)
             
             conn = sqlite3.connect(DB_PATH)
             c = conn.cursor()
             try:
-                c.execute("INSERT INTO users (name, encoding) VALUES (?, ?)", (name, encoding_blob))
+                c.execute("INSERT INTO users (name, landmarks) VALUES (?, ?)", (name, blob))
                 conn.commit()
-                st.success(f"🎉 User **{name}** registered successfully!")
-                st.balloons()
+                st.success(f"🎉 **{name}** registered!")
             except sqlite3.IntegrityError:
-                st.error("❌ Name already exists!")
+                st.error("Name already exists!")
             conn.close()
         else:
-            st.error("❌ No face detected in any uploaded image.")
+            st.error("No faces detected in uploads.")
 
-# ====================== TAB 2: MARK ATTENDANCE ======================
 with tab2:
     st.header("Mark Attendance")
-    source = st.radio("Choose input source", ["📷 Camera (Live)", "📤 Upload Image"])
+    source = st.radio("Input", ["📷 Camera", "📤 Upload"])
     
-    if source == "📷 Camera (Live)":
-        captured = st.camera_input("Take a photo")
+    if source == "📷 Camera":
+        captured = st.camera_input("Take photo")
         if captured:
             uploaded_file = captured
     else:
-        uploaded_file = st.file_uploader("Upload photo containing face(s)", type=["jpg", "jpeg", "png"])
+        uploaded_file = st.file_uploader("Upload photo", type=["jpg", "jpeg", "png"])
     
     if uploaded_file:
-        st.subheader("Processing...")
         image_np, image_pil = process_image_for_recognition(uploaded_file)
         
-        face_locations = face_recognition.face_locations(image_np)
-        face_encodings = face_recognition.face_encodings(image_np, face_locations)
+        # Detection first (bounding boxes)
+        detection_results = face_detection.process(image_np)
+        face_locations = []
+        if detection_results.detections:
+            for det in detection_results.detections:
+                bbox = det.location_data.relative_bounding_box
+                face_locations.append((bbox.ymin, bbox.xmin, bbox.ymin + bbox.height, bbox.xmin + bbox.width))
         
-        known_names, known_encodings = load_known_faces()
+        face_vecs = []
+        for loc in face_locations:
+            # Crop face roughly (improve later)
+            h, w, _ = image_np.shape
+            ymin, xmin, ymax, xmax = [int(x * dim) for x, dim in zip(loc, [h, w, h, w])]
+            face_crop = image_np[max(0, ymin-20):min(h, ymax+20), max(0, xmin-20):min(w, xmax+20)]
+            vec = extract_landmarks(face_crop)
+            if vec is not None:
+                face_vecs.append(vec)
         
+        known_names, known_vecs = load_known_faces()
         recognized_names = []
         
-        for face_encoding, location in zip(face_encodings, face_locations):
+        for vec in face_vecs:
             name = "Unknown"
-            if known_encodings:
-                distances = face_recognition.face_distance(known_encodings, face_encoding)
-                best_match_index = np.argmin(distances)
-                if distances[best_match_index] <= 0.55:  # Strict tolerance
-                    name = known_names[best_match_index]
+            if known_vecs:
+                sims = [cosine_similarity(vec, kv) for kv in known_vecs]
+                best_idx = np.argmax(sims)
+                if sims[best_idx] > 0.92:  # Tune: 0.90–0.95 range
+                    name = known_names[best_idx]
                     mark_attendance_in_db(name)
             recognized_names.append(name)
         
-        # Draw boxes & labels
         final_image = draw_recognized_faces(image_pil, face_locations, recognized_names)
-        st.image(final_image, caption="Detected & Recognized Faces", use_column_width=True)
+        st.image(final_image, use_column_width=True)
         
-        if recognized_names:
-            st.subheader("Recognized People")
-            for n in set([x for x in recognized_names if x != "Unknown"]):
+        if any(n != "Unknown" for n in recognized_names):
+            st.subheader("Recognized")
+            for n in set(n for n in recognized_names if n != "Unknown"):
                 st.success(f"✅ {n}")
 
-# ====================== TAB 3: REGISTERED USERS ======================
 with tab3:
     st.header("Registered Users")
     known_names, _ = load_known_faces()
     if known_names:
-        df_users = pd.DataFrame({"Name": known_names})
-        st.dataframe(df_users, use_container_width=True)
-        st.write(f"**Total registered users: {len(known_names)}**")
+        st.dataframe(pd.DataFrame({"Name": known_names}))
     else:
-        st.info("No users registered yet.")
+        st.info("No users yet.")
 
-# ====================== TAB 4: ATTENDANCE LOGS ======================
 with tab4:
     st.header("Attendance Logs")
     conn = sqlite3.connect(DB_PATH)
-    df_att = pd.read_sql_query("SELECT name, date, time FROM attendance ORDER BY date DESC, time DESC", conn)
+    df = pd.read_sql_query("SELECT name, date, time FROM attendance ORDER BY date DESC, time DESC", conn)
     conn.close()
-    
-    if not df_att.empty:
-        st.dataframe(df_att, use_container_width=True)
-        st.download_button("Download CSV", df_att.to_csv(index=False), "attendance_log.csv")
+    if not df.empty:
+        st.dataframe(df)
+        st.download_button("Download CSV", df.to_csv(index=False), "attendance.csv")
     else:
-        st.info("No attendance records yet.")
-
-st.caption("Built with ❤️ using face_recognition + Streamlit + SQLite")
+        st.info("No records yet.")
