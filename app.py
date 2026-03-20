@@ -1,3 +1,6 @@
+pip install streamlit mediapipe opencv-python-headless pillow numpy pandas
+
+
 import streamlit as st
 import mediapipe as mp
 import cv2
